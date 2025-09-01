@@ -1,35 +1,51 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Live Detection Map</title>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Elephant Alert - Live Map & Camera Detection</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
 <style>
-  #map { height: 500px; width: 100%; margin-top: 20px; }
-  #video { width: 400px; height: 300px; border: 1px solid black; display: none; }
-  #cameraBtn { padding: 10px 20px; font-size: 16px; }
+  body, html { margin:0; padding:0; font-family: Arial; height: 100%; }
+  #map { height: 70vh; width: 100%; }
+  #controls { padding: 10px; display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; align-items: center; background: #f0f0f0; }
+  input { padding: 5px; width: 200px; }
+  button { padding: 8px 15px; background: crimson; color: white; border: none; border-radius: 5px; cursor: pointer; }
+  button:disabled { background: #aa0000; cursor: not-allowed; }
+  #video { width: 300px; height: 200px; display: none; border: 1px solid black; }
+  #status { text-align:center; margin-top:5px; font-weight:bold; }
 </style>
 </head>
 <body>
 
-<h2>Live Person Detection Map</h2>
-<button id="cameraBtn">Camera On</button>
-<video id="video" autoplay muted></video>
+<div id="controls">
+  <label>Start Location:</label>
+  <input type="text" id="start-location" readonly />
+  <label>Destination:</label>
+  <input type="text" id="destination-location" placeholder="Click map to select destination" readonly />
+  <button id="start-drive-btn" disabled>Start Drive</button>
+  <button id="stop-drive-btn" disabled>Stop Drive</button>
+  <button id="manual-elephant-btn">Add Elephant Manually</button>
+  <button id="camera-btn">Camera On</button>
+  <video id="video" autoplay muted></video>
+</div>
+
 <div id="map"></div>
+<div id="status"></div>
 
-<!-- Firebase -->
-<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 
-<!-- TensorFlow.js + Coco-SSD -->
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.1.0/firebase-app.js";
+  import { getDatabase, ref, onValue, push } from "https://www.gstatic.com/firebasejs/12.1.0/firebase-database.js";
 
-<!-- Google Maps API -->
-<script src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY"></script>
+  // TensorFlow for camera detection
+  import * as tf from "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.8.0/dist/tf.min.js";
+  import * as cocoSsd from "https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd";
 
-<script>
-  // Firebase Config
+  // Firebase config
   const firebaseConfig = {
     apiKey: "AIzaSyBPM55I08UVYhUm8XwETLlukc0btlKLE6Q",
     authDomain: "elephant-alert-68626.firebaseapp.com",
@@ -41,69 +57,151 @@
     measurementId: "G-WFZGXHZHHP",
   };
 
-  // Initialize Firebase
-  const app = firebase.initializeApp(firebaseConfig);
-  const database = firebase.database();
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
 
-  // Initialize Map
-  let map;
-  let marker;
-  function initMap() {
-    map = new google.maps.Map(document.getElementById('map'), {
-      zoom: 10,
-      center: { lat: 7.8731, lng: 80.7718 } // Sri Lanka
-    });
-  }
-  initMap();
+  // Map setup
+  const southWest = L.latLng(5.8371, 79.6506);
+  const northEast = L.latLng(10.0919, 81.8807);
+  const sriLankaBounds = L.latLngBounds(southWest, northEast);
 
-  // Video & Model
-  const video = document.getElementById('video');
-  let model;
+  const map = L.map("map", { maxBounds: sriLankaBounds, maxBoundsViscosity: 1.0, minZoom:7, maxZoom:15, attributionControl:false }).setView([7.8731, 80.7718], 8);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom:19 }).addTo(map);
 
-  document.getElementById('cameraBtn').addEventListener('click', () => {
-    // Show video
-    video.style.display = 'block';
-    navigator.mediaDevices.getUserMedia({ video: true })
-      .then(stream => { video.srcObject = stream; })
-      .catch(err => console.error("Webcam error:", err));
+  const startInput = document.getElementById("start-location");
+  const destInput = document.getElementById("destination-location");
+  const startDriveBtn = document.getElementById("start-drive-btn");
+  const stopDriveBtn = document.getElementById("stop-drive-btn");
+  const manualElephantBtn = document.getElementById("manual-elephant-btn");
+  const cameraBtn = document.getElementById("camera-btn");
+  const video = document.getElementById("video");
+  const statusDiv = document.getElementById("status");
 
-    // Load model
-    cocoSsd.load().then(loadedModel => {
-      model = loadedModel;
-      detectFrame();
+  const elephantIcon = L.divIcon({ html:`<div style="background:red;color:white;font-size:24px;width:40px;height:40px;text-align:center;border-radius:50%;line-height:40px;box-shadow:0 0 5px rgba(0,0,0,0.5)">🐘</div>`, className:"", iconSize:[40,40], iconAnchor:[20,40], popupAnchor:[0,-40]});
+  const driverIcon = L.divIcon({ html:`<div style="background:crimson;width:14px;height:14px;border-radius:50%;border:2px solid white;box-shadow:0 0 10px crimson;"></div>`, className:"", iconSize:[18,18], iconAnchor:[9,9] });
+
+  function isInsideSriLanka(lat,lng){ return sriLankaBounds.contains([lat,lng]); }
+  function deg2rad(deg){ return deg*(Math.PI/180);}
+  function getDistanceFromLatLonInKm(lat1,lon1,lat2,lon2){ const R=6371; const dLat=deg2rad(lat2-lat1); const dLon=deg2rad(lon2-lon1); const a=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(deg2rad(lat1))*Math.cos(deg2rad(lat2))*Math.sin(dLon/2)*Math.sin(dLon/2); const c=2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a)); return R*c;}
+
+  let elephantMarkers=[], driverMarker=null, watchId=null, destMarker=null, destination=null, manualAddMode=false;
+  
+  // Load existing elephants
+  onValue(ref(db,"elephants"), snapshot=>{
+    elephantMarkers.forEach(({marker})=>{ map.removeLayer(marker); });
+    elephantMarkers=[];
+    const data = snapshot.val();
+    if(data) Object.values(data).forEach(elephant=>{
+      if(isInsideSriLanka(elephant.latitude,elephant.longitude)){
+        const marker=L.marker([elephant.latitude,elephant.longitude],{icon:elephantIcon}).addTo(map);
+        marker.bindPopup("🐘 Elephant reported here");
+        elephantMarkers.push({data:elephant,marker});
+      }
     });
   });
 
-  function detectFrame() {
-    model.detect(video).then(predictions => {
-      const personDetected = predictions.some(pred => pred.class === 'person' && pred.score > 0.5);
-      if(personDetected){
-        console.log("Person detected!");
-        
-        // Example location near map center (replace with real GPS if available)
-        const lat = 7.8731 + (Math.random()-0.5)*0.05;
-        const lng = 80.7718 + (Math.random()-0.5)*0.05;
+  // Driver location setup
+  if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(pos=>{
+      const {latitude,longitude}=pos.coords;
+      if(isInsideSriLanka(latitude,longitude)){
+        startInput.value=`${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
+        map.setView([latitude,longitude],13);
+      } else statusDiv.textContent="Your location is outside Sri Lanka bounds.";
+    },()=>{ statusDiv.textContent="Could not get your location."; });
+  } else statusDiv.textContent="Geolocation not supported.";
 
-        // Update Firebase
-        database.ref('liveDetection').set({
-          detected: true,
-          latitude: lat,
-          longitude: lng,
-          timestamp: Date.now()
-        });
+  // Map click to select destination
+  map.on("click", e=>{
+    if(driverMarker || manualAddMode) return;
+    const {lat,lng}=e.latlng;
+    if(!isInsideSriLanka(lat,lng)){ alert("Destination must be inside Sri Lanka."); return; }
+    destination={lat,lng};
+    destInput.value=`${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+    if(destMarker) destMarker.setLatLng([lat,lng]);
+    else destMarker=L.marker([lat,lng]).addTo(map);
+    startDriveBtn.disabled=false;
+    statusDiv.textContent="Destination selected. Click Start Drive.";
+  });
 
-        // Update Map
-        const pos = {lat, lng};
-        if(!marker){
-          marker = new google.maps.Marker({position: pos, map: map});
-        } else {
-          marker.setPosition(pos);
-        }
-        map.setCenter(pos);
-      }
-      requestAnimationFrame(detectFrame);
-    });
+  // Start Drive
+  startDriveBtn.addEventListener("click",()=>{
+    if(!startInput.value || !destination){ alert("Start or Destination not set."); return; }
+    startDriveBtn.disabled=true; manualElephantBtn.disabled=true; destInput.disabled=true;
+    statusDiv.textContent="Drive mode ON. Tracking your location...";
+    if(!navigator.geolocation){ alert("Geolocation not supported."); return; }
+
+    watchId=navigator.geolocation.watchPosition(position=>{
+      const lat=position.coords.latitude, lng=position.coords.longitude;
+      if(!isInsideSriLanka(lat,lng)){ statusDiv.textContent="You are outside Sri Lanka bounds."; return; }
+      if(!driverMarker) driverMarker=L.marker([lat,lng],{icon:driverIcon}).addTo(map);
+      else driverMarker.setLatLng([lat,lng]);
+      map.panTo([lat,lng]);
+      elephantMarkers.forEach(({data,marker})=>{
+        const dist=getDistanceFromLatLonInKm(lat,lng,data.latitude,data.longitude);
+        if(dist<=5) marker.openPopup(); else marker.closePopup();
+      });
+    }, error=>{ statusDiv.textContent=`Error getting location: ${error.message}`; }, { enableHighAccuracy:true, maximumAge:10000, timeout:10000 });
+
+    stopDriveBtn.disabled=false;
+  });
+
+  stopDriveBtn.addEventListener("click",()=>{
+    if(watchId!==null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+    if(driverMarker){ map.removeLayer(driverMarker); driverMarker=null; }
+    statusDiv.textContent="Drive mode stopped."; startDriveBtn.disabled=false; stopDriveBtn.disabled=true; manualElephantBtn.disabled=false; destInput.disabled=false;
+  });
+
+  // Manual Elephant Add
+  manualElephantBtn.addEventListener("click",()=>{
+    manualAddMode=!manualAddMode;
+    if(manualAddMode){
+      manualElephantBtn.textContent="Click map to add elephant. Click to cancel.";
+      statusDiv.textContent="Manual Elephant Add mode: Click anywhere on map.";
+      startDriveBtn.disabled=true; stopDriveBtn.disabled=true; destInput.disabled=true;
+    } else{
+      manualElephantBtn.textContent="Add Elephant Manually";
+      statusDiv.textContent=""; startDriveBtn.disabled=destination?false:true; destInput.disabled=false;
+    }
+  });
+
+  map.on("click", e=>{
+    if(!manualAddMode) return;
+    const {lat,lng}=e.latlng;
+    if(!isInsideSriLanka(lat,lng)){ alert("Elephant must be inside Sri Lanka."); return; }
+    push(ref(db,"elephants"),{ latitude:lat, longitude:lng, timestamp:Date.now() });
+    alert(`Elephant manually added at ${lat.toFixed(6)}, ${lng.toFixed(6)}.`);
+    manualAddMode=false; manualElephantBtn.textContent="Add Elephant Manually"; statusDiv.textContent=""; startDriveBtn.disabled=destination?false:true; destInput.disabled=false;
+  });
+
+  // Camera Person Detection
+  let model;
+  cameraBtn.addEventListener("click", async()=>{
+    video.style.display="block";
+    const stream=await navigator.mediaDevices.getUserMedia({video:true});
+    video.srcObject=stream;
+    model=await cocoSsd.load();
+    detectFrame();
+  });
+
+  async function detectFrame(){
+    const predictions=await model.detect(video);
+    const personDetected=predictions.some(pred=>pred.class==="person" && pred.score>0.5);
+    if(personDetected){
+      statusDiv.textContent="Person detected!";
+
+      navigator.geolocation.getCurrentPosition(pos=>{
+        const {latitude,longitude}=pos.coords;
+        push(ref(db,"elephants"),{ latitude, longitude, timestamp:Date.now() });
+
+        const marker=L.marker([latitude,longitude],{icon:L.divIcon({ html:`<div style="background:red;width:20px;height:20px;border-radius:50%;"></div>`, className:"", iconSize:[20,20], iconAnchor:[10,10] })}).addTo(map);
+        marker.bindPopup("Person detected here!").openPopup();
+      });
+    }
+    requestAnimationFrame(detectFrame);
   }
+
 </script>
 </body>
 </html>
+
